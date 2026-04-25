@@ -6,6 +6,7 @@ package core
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +22,75 @@ import (
 
 func ptr[T any](v T) *T {
 	return &v
+}
+
+func TestBuildDescriptionBuilderGroupAddsBHDMediaInfoPreviewOnly(t *testing.T) {
+	t.Parallel()
+
+	mediaInfoPath := filepath.Join(t.TempDir(), "MEDIAINFO.txt")
+	if err := os.WriteFile(mediaInfoPath, []byte(coreDescriptionBuilderMediaInfoSample()), 0o600); err != nil {
+		t.Fatalf("write mediainfo: %v", err)
+	}
+
+	group := buildDescriptionBuilderGroup(api.PreparationDescription{
+		GroupKey:        "bhd",
+		Trackers:        []string{"BHD"},
+		RawDescription:  "",
+		Description:     "Generated BHD description",
+		DescriptionHTML: descriptionHTMLForTest("Generated BHD description"),
+	}, nil, api.PreparedMetadata{MediaInfoTextPath: mediaInfoPath}, api.NopLogger{})
+
+	if group.RawDescription != "Generated BHD description" {
+		t.Fatalf("expected raw description unchanged, got %q", group.RawDescription)
+	}
+	if !strings.Contains(group.RawDescriptionHTML, `class="mediainfo"`) {
+		t.Fatalf("expected BHD mediainfo preview html, got %q", group.RawDescriptionHTML)
+	}
+	if !strings.Contains(group.RawDescriptionHTML, "Generated BHD description") {
+		t.Fatalf("expected generated description to remain in preview html, got %q", group.RawDescriptionHTML)
+	}
+}
+
+func TestBuildDescriptionBuilderGroupDoesNotAugmentOverrides(t *testing.T) {
+	t.Parallel()
+
+	mediaInfoPath := filepath.Join(t.TempDir(), "MEDIAINFO.txt")
+	if err := os.WriteFile(mediaInfoPath, []byte(coreDescriptionBuilderMediaInfoSample()), 0o600); err != nil {
+		t.Fatalf("write mediainfo: %v", err)
+	}
+
+	group := buildDescriptionBuilderGroup(api.PreparationDescription{
+		GroupKey:    "hdb",
+		Trackers:    []string{"HDB"},
+		Description: "Generated HDB description",
+	}, map[string]api.DescriptionOverride{
+		"hdb": {Description: "custom override"},
+	}, api.PreparedMetadata{MediaInfoTextPath: mediaInfoPath}, api.NopLogger{})
+
+	if group.RawDescription != "custom override" {
+		t.Fatalf("expected override raw description, got %q", group.RawDescription)
+	}
+	if strings.Contains(group.RawDescriptionHTML, `class="mediainfo"`) {
+		t.Fatalf("did not expect override preview to be augmented, got %q", group.RawDescriptionHTML)
+	}
+}
+
+func descriptionHTMLForTest(value string) string {
+	return value
+}
+
+func coreDescriptionBuilderMediaInfoSample() string {
+	return `General
+Complete name : C:\Media\Movie.2024.1080p.mkv
+Format : Matroska
+File size : 10.4 GiB
+Duration : 1 h 42 min
+Overall bit rate : 14.6 Mb/s
+
+Video
+Format : AVC
+Width : 1 920 pixels
+Height : 1 080 pixels`
 }
 
 func TestGetHistoryOverviewIncludesGroupedDescriptionOverrides(t *testing.T) {

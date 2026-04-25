@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -1463,32 +1464,91 @@ func (c *Core) FetchDescriptionBuilderPreview(ctx context.Context, req api.Reque
 	if len(prep.Descriptions) > 0 {
 		preview.Groups = make([]api.DescriptionBuilderGroup, 0, len(prep.Descriptions))
 		for _, entry := range prep.Descriptions {
-			preview.Groups = append(preview.Groups, buildDescriptionBuilderGroup(entry, overrideByGroup))
+			preview.Groups = append(preview.Groups, buildDescriptionBuilderGroup(entry, overrideByGroup, meta, c.logger))
 		}
 	}
 	c.logger.Infof("core: description builder prepared source=%s groups=%d", preview.SourcePath, len(preview.Groups))
 	return preview, nil
 }
 
-func buildDescriptionBuilderGroup(entry api.PreparationDescription, overrideByGroup map[string]api.DescriptionOverride) api.DescriptionBuilderGroup {
+func buildDescriptionBuilderGroup(entry api.PreparationDescription, overrideByGroup map[string]api.DescriptionOverride, meta api.PreparedMetadata, logger api.Logger) api.DescriptionBuilderGroup {
 	groupKey := normalizeDescriptionBuilderGroupKey(entry.GroupKey, entry.Trackers)
 	rawDescription := entry.RawDescription
+	rawDescriptionHTML := entry.RawDescriptionHTML
 	if strings.TrimSpace(rawDescription) == "" {
 		rawDescription = entry.Description
+		rawDescriptionHTML = entry.DescriptionHTML
 	}
 	hasOverride := entry.HasOverride
 	if override, ok := overrideByGroup[groupKey]; ok && strings.TrimSpace(override.Description) != "" {
 		rawDescription = override.Description
+		rawDescriptionHTML = description.Render(override.Description)
 		hasOverride = true
+	}
+	if strings.TrimSpace(rawDescriptionHTML) == "" {
+		rawDescriptionHTML = description.Render(rawDescription)
+	}
+	if !hasOverride {
+		rawDescriptionHTML = augmentDescriptionBuilderPreviewHTML(rawDescriptionHTML, entry, meta, logger)
 	}
 	return api.DescriptionBuilderGroup{
 		GroupKey:           groupKey,
 		Trackers:           append([]string{}, entry.Trackers...),
 		RawDescription:     rawDescription,
-		RawDescriptionHTML: description.Render(rawDescription),
+		RawDescriptionHTML: rawDescriptionHTML,
 		HasOverride:        hasOverride,
 		ImageHost:          entry.ImageHost,
 	}
+}
+
+func augmentDescriptionBuilderPreviewHTML(rendered string, entry api.PreparationDescription, meta api.PreparedMetadata, logger api.Logger) string {
+	if !descriptionBuilderGroupNeedsMediaInfoPreview(entry) {
+		return rendered
+	}
+	if strings.Contains(strings.ToLower(rendered), "mediainfo") {
+		return rendered
+	}
+	mediaInfo := descriptionBuilderMediaInfoText(meta, logger)
+	if strings.TrimSpace(mediaInfo) == "" {
+		return rendered
+	}
+	mediaHTML := description.Render("[mediainfo]" + mediaInfo + "[/mediainfo]")
+	if strings.TrimSpace(mediaHTML) == "" {
+		return rendered
+	}
+	if strings.TrimSpace(rendered) == "" {
+		return mediaHTML
+	}
+	return strings.TrimSpace(rendered) + "\n\n" + mediaHTML
+}
+
+func descriptionBuilderGroupNeedsMediaInfoPreview(entry api.PreparationDescription) bool {
+	candidates := append([]string{entry.GroupKey}, entry.Trackers...)
+	for _, candidate := range candidates {
+		switch strings.ToUpper(strings.TrimSpace(candidate)) {
+		case "BHD", "HDB":
+			return true
+		}
+	}
+	return false
+}
+
+func descriptionBuilderMediaInfoText(meta api.PreparedMetadata, logger api.Logger) string {
+	if strings.TrimSpace(meta.DVDVOBMediaInfoText) != "" {
+		return strings.TrimSpace(meta.DVDVOBMediaInfoText)
+	}
+	path := strings.TrimSpace(meta.MediaInfoTextPath)
+	if path == "" {
+		return ""
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		if logger != nil {
+			logger.Debugf("core: description builder failed to read mediainfo text path=%s: %v", path, err)
+		}
+		return ""
+	}
+	return strings.TrimSpace(string(payload))
 }
 
 func normalizeDescriptionBuilderGroupKey(groupKey string, trackersList []string) string {
@@ -1607,7 +1667,7 @@ func (c *Core) FetchDescriptionBuilderGroupPreview(ctx context.Context, req api.
 	for _, entry := range prep.Descriptions {
 		normalizedGroupKey := normalizeDescriptionBuilderGroupKey(entry.GroupKey, entry.Trackers)
 		if strings.EqualFold(normalizedGroupKey, targetGroup) {
-			group := buildDescriptionBuilderGroup(entry, overrideByGroup)
+			group := buildDescriptionBuilderGroup(entry, overrideByGroup, meta, c.logger)
 			if len(group.Trackers) == 0 && len(req.Trackers) > 0 {
 				group.Trackers = append([]string{}, req.Trackers...)
 			}
@@ -3232,7 +3292,7 @@ func (c *Core) resolveCanonicalDescriptionGroups(ctx context.Context, meta api.P
 
 	groups := make([]api.DescriptionBuilderGroup, 0, len(prep.Descriptions))
 	for _, entry := range prep.Descriptions {
-		groups = append(groups, buildDescriptionBuilderGroup(entry, overrideByGroup))
+		groups = append(groups, buildDescriptionBuilderGroup(entry, overrideByGroup, meta, c.logger))
 	}
 	return groups, nil
 }
