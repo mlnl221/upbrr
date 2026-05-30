@@ -4,6 +4,7 @@
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
+import { OnFileDrop, OnFileDropOff } from "../wailsjs/runtime/runtime";
 import { EventsOn, isBrowserMode, isBrowserNativeBrowseAvailable } from "./utils/runtime";
 import DescriptionBuilderPage from "./pages/description_builder";
 import BlurayCandidatesPage from "./pages/bluray_candidates";
@@ -62,6 +63,17 @@ import {
   isSkipAutoTorrentEnabled,
   normalizeDefaultTrackerList,
 } from "./utils/settings";
+import {
+  addSourcePathHistoryEntry,
+  defaultInputHistoryLimit,
+  filterBrowseEntries,
+  inferSourcePathMode,
+  normalizeSourcePathHistory,
+  resolveInputHistoryLimit,
+  type SourcePathHistoryEntry,
+  type SourcePathMode,
+  sourcePathHistoryStorageKey,
+} from "./utils/inputHistory";
 
 const appLayoutClass =
   "relative z-[1] block min-h-screen ml-[172px] max-[960px]:ml-0 max-[960px]:pb-[78px]";
@@ -194,6 +206,12 @@ const dupeCheckEventPrefix = "dupe:job:";
 const trackerUploadEventPrefix = "upload:job:";
 const trackerUploadProgressEvent = "upload:progress";
 const runLogLevels = ["error", "warn", "info", "debug", "trace"] as const;
+
+type SourcePathSelection = {
+  path: string;
+  mode: SourcePathMode;
+  waitsForPlaylistSelection: boolean;
+};
 
 const progressUpdatePrefixes = new Set([
   "scanning",
@@ -546,6 +564,17 @@ export default function App() {
   const browserMode = isBrowserMode();
   const browserNativeBrowseAvailable = !browserMode || isBrowserNativeBrowseAvailable();
   const [path, setPath] = useState("");
+  const [sourcePathHistory, setSourcePathHistory] = useState<SourcePathHistoryEntry[]>(() => {
+    try {
+      return normalizeSourcePathHistory(
+        JSON.parse(localStorage.getItem(sourcePathHistoryStorageKey) || "[]"),
+        defaultInputHistoryLimit,
+      );
+    } catch {
+      return [];
+    }
+  });
+  const [sourcePathMode, setSourcePathMode] = useState<SourcePathMode | undefined>();
   const [currentDiscType, setCurrentDiscType] = useState("");
   const [sourceLookupURL, setSourceLookupURL] = useState("");
   const [loading, setLoading] = useState(false);
@@ -652,10 +681,13 @@ export default function App() {
   const freshUIStateCanPromoteRef = useRef(false);
   const uiStateSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const uiStateResumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sourcePathDropHandlerRef = useRef<(paths: string[]) => void>(() => undefined);
   const [hostBrowserMode, setHostBrowserMode] = useState<"file" | "folder" | null>(null);
   const [hostBrowser, setHostBrowser] = useState<BrowseDirectoryResponse | null>(null);
   const [hostBrowserLoading, setHostBrowserLoading] = useState(false);
   const [hostBrowserError, setHostBrowserError] = useState("");
+  const [hostBrowserSearch, setHostBrowserSearch] = useState("");
+  const [debouncedHostBrowserSearch, setDebouncedHostBrowserSearch] = useState("");
   const hostBrowserEntryRefs = useRef<Array<HTMLDivElement | null>>([]);
 
   const builderDirty = useMemo(
@@ -699,6 +731,53 @@ export default function App() {
     resolveImageHostLabel,
     trackerSelectionNames,
   } = useSettingsState({ activeTab });
+
+  const inputHistoryLimit = useMemo(() => {
+    const mainSettings = ((configData as ConfigMap | null)?.MainSettings ??
+      null) as ConfigMap | null;
+    return resolveInputHistoryLimit(mainSettings?.InputHistoryLimit);
+  }, [configData]);
+
+  const persistSourcePathHistory = useCallback((entries: SourcePathHistoryEntry[]) => {
+    try {
+      if (entries.length === 0) {
+        localStorage.removeItem(sourcePathHistoryStorageKey);
+        return;
+      }
+      localStorage.setItem(sourcePathHistoryStorageKey, JSON.stringify(entries));
+    } catch {
+      // Storage may be unavailable in locked-down browser sessions.
+    }
+  }, []);
+
+  const rememberSourcePath = useCallback(
+    (value: string, mode?: SourcePathMode) => {
+      setSourcePathHistory((prev) => {
+        const next = addSourcePathHistoryEntry(
+          prev,
+          value,
+          mode ?? inferSourcePathMode(value),
+          inputHistoryLimit,
+        );
+        persistSourcePathHistory(next);
+        return next;
+      });
+    },
+    [inputHistoryLimit, persistSourcePathHistory],
+  );
+
+  const handleSourcePathChange = useCallback((value: string) => {
+    setPath(value);
+    setSourcePathMode(undefined);
+  }, []);
+
+  useEffect(() => {
+    setSourcePathHistory((prev) => {
+      const next = normalizeSourcePathHistory(prev, inputHistoryLimit);
+      persistSourcePathHistory(next);
+      return next;
+    });
+  }, [inputHistoryLimit, persistSourcePathHistory]);
 
   const configuredRunLogLevel = useMemo(() => {
     const loggingSection = ((configData as ConfigMap | null)?.Logging ?? null) as ConfigMap | null;
@@ -1325,7 +1404,10 @@ export default function App() {
 
   const applyUIState = useCallback(
     (state: UIState) => {
-      if (typeof state.path === "string") setPath(state.path);
+      if (typeof state.path === "string") {
+        setPath(state.path);
+        setSourcePathMode(undefined);
+      }
       if (typeof state.sourceLookupURL === "string") setSourceLookupURL(state.sourceLookupURL);
       if (typeof state.activeTab === "string") setActiveTab(state.activeTab);
       if (state.preview) setPreview({ ...emptyPreview, ...state.preview });
@@ -1872,6 +1954,7 @@ export default function App() {
         clearTimeout(uiStateSaveTimerRef.current);
       }
       setPath("");
+      setSourcePathMode(undefined);
       setSourceLookupURL("");
       setLoading(false);
       setMetadataResetting(false);
@@ -2342,6 +2425,11 @@ export default function App() {
     resetScreenshotState();
   };
 
+  const clearHostBrowserSearch = () => {
+    setHostBrowserSearch("");
+    setDebouncedHostBrowserSearch("");
+  };
+
   const openHostBrowser = async (mode: "file" | "folder", startPath = "") => {
     const browser = globalThis.go?.guiapp?.App?.BrowseDirectory;
     if (!browser) {
@@ -2351,6 +2439,7 @@ export default function App() {
     setHostBrowserMode(mode);
     setHostBrowserLoading(true);
     setHostBrowserError("");
+    clearHostBrowserSearch();
     try {
       const selectedStart = startPath || path.trim();
       const result = await browser(selectedStart, mode);
@@ -2397,7 +2486,24 @@ export default function App() {
     setHostBrowserMode(null);
     setHostBrowser(null);
     setHostBrowserError("");
+    clearHostBrowserSearch();
   };
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedHostBrowserSearch(hostBrowserSearch);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [hostBrowserSearch]);
+
+  const hostBrowserEntries = useMemo(
+    () => filterBrowseEntries(hostBrowser?.entries || [], debouncedHostBrowserSearch),
+    [hostBrowser?.entries, debouncedHostBrowserSearch],
+  );
+
+  useEffect(() => {
+    hostBrowserEntryRefs.current = [];
+  }, [hostBrowserEntries]);
 
   useEffect(() => {
     if (!hostBrowserMode || hostBrowserLoading) {
@@ -2405,7 +2511,7 @@ export default function App() {
     }
 
     hostBrowserEntryRefs.current.find((entry) => entry !== null)?.focus();
-  }, [hostBrowser?.currentPath, hostBrowser?.entries.length, hostBrowserLoading, hostBrowserMode]);
+  }, [hostBrowser?.currentPath, hostBrowserLoading, hostBrowserMode]);
 
   const browseHostDirectory = async (nextPath: string) => {
     if (!hostBrowserMode) {
@@ -2495,42 +2601,56 @@ export default function App() {
   };
 
   // Auto-detect BDMV and show playlist selection
-  const handlePathSelected = async (selectedPath: string, mode: "file" | "folder" = "folder") => {
+  const handlePathSelected = async (
+    selectedPath: string,
+    mode?: SourcePathMode,
+  ): Promise<SourcePathSelection | null> => {
     freshUIStateCanPromoteRef.current = false;
-    setPath(selectedPath);
-    const discType = await detectDiscType(selectedPath);
+    const trimmedPath = selectedPath.trim();
+    if (!trimmedPath) {
+      return null;
+    }
+    const selectedMode = mode ?? inferSourcePathMode(trimmedPath);
+    setPath(trimmedPath);
+    setSourcePathMode(selectedMode);
+    rememberSourcePath(trimmedPath, selectedMode);
+    const discType = await detectDiscType(trimmedPath);
     setCurrentDiscType(discType);
     setShowExternalIDInputUI(true);
     setPlaylistPreparationError("");
     setBdinfoProgressLines([]);
     setPlaylistAutoPreparing(false);
 
-    if (mode === "file") {
+    if (selectedMode === "file") {
       setShowPlaylistSelection(false);
       setPlaylistSelectionPath("");
       setActiveTab("input");
-      return;
+      return { path: trimmedPath, mode: selectedMode, waitsForPlaylistSelection: false };
     }
 
     if (discType !== "BDMV") {
       setShowPlaylistSelection(false);
       setPlaylistSelectionPath("");
       setActiveTab("input");
-      return;
+      return { path: trimmedPath, mode: selectedMode, waitsForPlaylistSelection: false };
     }
 
-    // Smart path detection: check if path already contains BDMV or PLAYLIST
-    const upperPath = selectedPath.toUpperCase();
-    let bdmvPath = selectedPath;
+    const upperPath = trimmedPath.toUpperCase();
+    let bdmvPath = trimmedPath;
 
     if (!upperPath.includes("\\BDMV") && !upperPath.includes("/BDMV")) {
-      // Try BDMV subfolder first
-      bdmvPath = `${selectedPath}/BDMV`;
+      bdmvPath = `${trimmedPath}/BDMV`;
     }
 
     // Set the path for playlist discovery (component will discover the playlists)
     setPlaylistSelectionPath(bdmvPath);
     setShowPlaylistSelection(true);
+    return { path: trimmedPath, mode: selectedMode, waitsForPlaylistSelection: true };
+  };
+
+  const handleSourcePathHistorySelect = async (entry: SourcePathHistoryEntry) => {
+    setError("");
+    await handlePathSelected(entry.path, entry.mode);
   };
 
   const runPlaylistBDInfo = async () => {
@@ -2570,6 +2690,7 @@ export default function App() {
     overrides: ExternalIDOverrides,
     nameOverrides: ReleaseNameOverrides,
     hideExternalIDInputUIOnSuccess = false,
+    options: { targetPath?: string; targetMode?: SourcePathMode } = {},
   ) => {
     setError("");
     setDupeChecked(false);
@@ -2587,11 +2708,11 @@ export default function App() {
       setError("Fetch metadata is unavailable in this build.");
       return;
     }
-    if (!path.trim()) {
+    const targetPath = (options.targetPath ?? path).trim();
+    if (!targetPath) {
       setError("Please select a file or folder.");
       return;
     }
-    const targetPath = path.trim();
     setMetadataProgressTarget(targetPath);
     setMetadataProgressUpdates([]);
     setMetadataProgressActive(true);
@@ -2605,6 +2726,10 @@ export default function App() {
         getSelectedTrackers(),
       );
       applyPreviewResult(result);
+      rememberSourcePath(
+        targetPath,
+        options.targetMode ?? sourcePathMode ?? inferSourcePathMode(targetPath),
+      );
       freshUIStateCanPromoteRef.current = uiStateMode === "fresh";
       setShowExternalIDInputUI(!hideExternalIDInputUIOnSuccess);
     } catch (err) {
@@ -2618,6 +2743,50 @@ export default function App() {
   const handleFetch = async () => {
     await runFetch({}, {}, false);
   };
+
+  const handleSourcePathDrop = async (paths: string[]) => {
+    if (loading) {
+      setError("Metadata fetch is already running.");
+      return;
+    }
+    const droppedPath = paths.find((candidate) => candidate.trim())?.trim() || "";
+    if (!droppedPath) {
+      setError("Dropped file path was empty.");
+      return;
+    }
+    setError("");
+    const selection = await handlePathSelected(droppedPath);
+    if (!selection || selection.waitsForPlaylistSelection) {
+      return;
+    }
+    await runFetch({}, {}, false, {
+      targetPath: selection.path,
+      targetMode: selection.mode,
+    });
+  };
+
+  sourcePathDropHandlerRef.current = (paths: string[]) => {
+    void handleSourcePathDrop(paths);
+  };
+
+  useEffect(() => {
+    const runtime = (
+      globalThis as typeof globalThis & {
+        runtime?: { OnFileDrop?: unknown; OnFileDropOff?: unknown };
+      }
+    ).runtime;
+    if (browserMode || typeof runtime?.OnFileDrop !== "function") {
+      return;
+    }
+    OnFileDrop((_x, _y, paths) => {
+      sourcePathDropHandlerRef.current(paths);
+    }, true);
+    return () => {
+      if (typeof runtime.OnFileDropOff === "function") {
+        OnFileDropOff();
+      }
+    };
+  }, [browserMode]);
 
   const clearEditAttributesState = () => {
     setIdEdits(buildIDEditState(emptyPreview.ExternalIDs));
@@ -4420,7 +4589,9 @@ export default function App() {
           ) : (
             <InputPage
               path={path}
-              setPath={setPath}
+              handleSourcePathChange={handleSourcePathChange}
+              sourcePathHistory={sourcePathHistory}
+              handleSourcePathHistorySelect={handleSourcePathHistorySelect}
               sourceLookupURL={sourceLookupURL}
               setSourceLookupURL={setSourceLookupURL}
               browseAvailable={browserMode || browserNativeBrowseAvailable}
@@ -4539,66 +4710,81 @@ export default function App() {
                     Select folder
                   </button>
                 ) : null}
+                <label className="host-browser-search" htmlFor="host-browser-search">
+                  <span>Search</span>
+                  <input
+                    id="host-browser-search"
+                    className="host-browser-search__input"
+                    value={hostBrowserSearch}
+                    onChange={(event) => setHostBrowserSearch(event.target.value)}
+                    placeholder="Filter current path"
+                    disabled={hostBrowserLoading || !hostBrowser}
+                  />
+                </label>
               </div>
               {hostBrowserError ? <p className="error">{hostBrowserError}</p> : null}
               {hostBrowserLoading ? <p className="muted">Loading host paths...</p> : null}
               {!hostBrowserLoading && hostBrowser ? (
                 <div className="host-browser-list">
-                  {hostBrowser.entries.map((entry, index) => (
-                    <div
-                      key={entry.path}
-                      className="host-browser-entry"
-                      ref={(element) => {
-                        hostBrowserEntryRefs.current[index] = element;
-                      }}
-                      tabIndex={0}
-                      onKeyDown={(event) => handleHostBrowserEntryKeyDown(event, entry, index)}
-                      onDoubleClick={() => {
-                        if (entry.isDir) {
-                          void browseHostDirectory(entry.path);
-                          return;
-                        }
-                        void selectHostPath(entry.path, entry.isDir);
-                      }}
-                    >
-                      <span className="host-browser-entry__name">
-                        {entry.isDir ? "[DIR] " : ""}
-                        {entry.name}
-                      </span>
-                      <span className="host-browser-entry__meta">
-                        {entry.isDir
-                          ? "Folder"
-                          : `${Math.round(entry.size / 1024).toLocaleString()} KiB`}
-                      </span>
-                      <span className="host-browser-entry__actions">
-                        {entry.isDir ? (
-                          <button
-                            className="ghost"
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void browseHostDirectory(entry.path);
-                            }}
-                          >
-                            Open
-                          </button>
-                        ) : null}
-                        {(hostBrowserMode === "folder" && entry.isDir) ||
-                        (hostBrowserMode === "file" && !entry.isDir) ? (
-                          <button
-                            className="primary"
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void selectHostPath(entry.path, entry.isDir);
-                            }}
-                          >
-                            Select
-                          </button>
-                        ) : null}
-                      </span>
-                    </div>
-                  ))}
+                  {hostBrowserEntries.length === 0 ? (
+                    <p className="muted host-browser-empty">No matching paths.</p>
+                  ) : (
+                    hostBrowserEntries.map((entry, index) => (
+                      <div
+                        key={entry.path}
+                        className="host-browser-entry"
+                        ref={(element) => {
+                          hostBrowserEntryRefs.current[index] = element;
+                        }}
+                        tabIndex={0}
+                        onKeyDown={(event) => handleHostBrowserEntryKeyDown(event, entry, index)}
+                        onDoubleClick={() => {
+                          if (entry.isDir) {
+                            void browseHostDirectory(entry.path);
+                            return;
+                          }
+                          void selectHostPath(entry.path, entry.isDir);
+                        }}
+                      >
+                        <span className="host-browser-entry__name">
+                          {entry.isDir ? "[DIR] " : ""}
+                          {entry.name}
+                        </span>
+                        <span className="host-browser-entry__meta">
+                          {entry.isDir
+                            ? "Folder"
+                            : `${Math.round(entry.size / 1024).toLocaleString()} KiB`}
+                        </span>
+                        <span className="host-browser-entry__actions">
+                          {entry.isDir ? (
+                            <button
+                              className="ghost"
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void browseHostDirectory(entry.path);
+                              }}
+                            >
+                              Open
+                            </button>
+                          ) : null}
+                          {(hostBrowserMode === "folder" && entry.isDir) ||
+                          (hostBrowserMode === "file" && !entry.isDir) ? (
+                            <button
+                              className="primary"
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void selectHostPath(entry.path, entry.isDir);
+                              }}
+                            >
+                              Select
+                            </button>
+                          ) : null}
+                        </span>
+                      </div>
+                    ))
+                  )}
                 </div>
               ) : null}
             </Dialog.Content>
