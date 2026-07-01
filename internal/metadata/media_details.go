@@ -21,6 +21,7 @@ import (
 	"github.com/autobrr/upbrr/internal/metadata/metautil"
 	"github.com/autobrr/upbrr/internal/paths"
 	"github.com/autobrr/upbrr/internal/pathutil"
+	"github.com/autobrr/upbrr/internal/redaction"
 	"github.com/autobrr/upbrr/internal/services/db"
 	"github.com/autobrr/upbrr/internal/trackers"
 	"github.com/autobrr/upbrr/pkg/api"
@@ -186,11 +187,75 @@ func (s *Service) ApplyMediaDetails(ctx context.Context, meta api.PreparedMetada
 	ApplyRequestScopedAudioPolicy(&meta, s.cfg, s.logger)
 	RebuildReleaseName(&meta, s.logger)
 
+	// Scene detection runs here — after external IDs are resolved and the release
+	// name is rebuilt — so the srrdb imdb: lookup has a resolved IMDb id and full
+	// normalized metadata, and so rename/scene fields are populated before tracker
+	// rules (which read meta.Scene / meta.SceneNFOPath / meta.SceneRenamed).
+	meta, err = s.applySceneDetection(ctx, meta)
+	if err != nil {
+		return api.PreparedMetadata{}, err
+	}
+	// Scene detection can supply the service (from the NFO), which WEB release
+	// names embed, so rebuild once more to fold in scene-derived metadata.
+	RebuildReleaseName(&meta, s.logger)
+
 	meta, err = s.applyTrackerRules(ctx, meta)
 	if err != nil {
 		return api.PreparedMetadata{}, err
 	}
 
+	return meta, nil
+}
+
+// applySceneDetection runs srrdb scene/rename detection and copies the result
+// onto meta. It is best-effort for transient srrdb/network failures (skip scene,
+// never block the upload), but context cancellation/deadline is propagated so the
+// pipeline aborts rather than continuing into tracker rules. Detection is gated
+// by config (scene_detection) via a nil detector.
+func (s *Service) applySceneDetection(ctx context.Context, meta api.PreparedMetadata) (api.PreparedMetadata, error) {
+	if s.scene == nil {
+		return meta, nil
+	}
+	result, err := s.scene.Detect(ctx, meta)
+	if err != nil {
+		switch {
+		case isContextError(ctx, err):
+			return meta, fmt.Errorf("metadata: scene detect: %w", err)
+		case isSceneNFOError(err):
+			if s.logger != nil {
+				s.logger.Warnf("metadata: scene nfo side effect failed: %s", redaction.RedactValue(err.Error(), nil))
+			}
+			// The primary match may still be present alongside a recoverable NFO
+			// side-effect error; apply it when it carries data.
+			if !sceneResultHasData(result) {
+				return meta, nil
+			}
+		default:
+			// Transient srrdb/network failure: skip scene, never block the upload.
+			if s.logger != nil {
+				s.logger.Debugf("metadata: scene detect skipped: %s", redaction.RedactValue(err.Error(), nil))
+			}
+			return meta, nil
+		}
+	}
+	applySceneResult(&meta, result)
+	// Detection now runs after ID resolution, so backfill a scene-discovered IMDb
+	// id only when resolution found none, so upload payloads still carry it.
+	if meta.ExternalIDs.IMDBID == 0 && result.IMDBID > 0 {
+		meta.ExternalIDs.IMDBID = result.IMDBID
+	}
+	if s.logger != nil {
+		if meta.Scene {
+			s.logger.Debugf("metadata: scene release detected name=%q imdb=%d renamed=%t", meta.SceneName, meta.SceneIMDB, meta.SceneRenamed)
+		}
+		if meta.SceneNFOPath != "" {
+			if meta.SceneNFONew {
+				s.logger.Debugf("metadata: scene nfo downloaded %s", meta.SceneNFOPath)
+			} else {
+				s.logger.Debugf("metadata: scene nfo found %s", meta.SceneNFOPath)
+			}
+		}
+	}
 	return meta, nil
 }
 

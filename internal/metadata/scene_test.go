@@ -6,12 +6,15 @@ package metadata
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/autobrr/upbrr/pkg/api"
@@ -21,6 +24,23 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type sceneLogRecorder struct {
+	api.NopLogger
+	lines []string
+}
+
+func (r *sceneLogRecorder) Debugf(format string, args ...any) {
+	r.lines = append(r.lines, fmt.Sprintf(format, args...))
+}
+
+func (r *sceneLogRecorder) Tracef(format string, args ...any) {
+	r.lines = append(r.lines, fmt.Sprintf(format, args...))
+}
+
+func (r *sceneLogRecorder) join() string {
+	return strings.Join(r.lines, "\n")
 }
 
 func TestSceneDetectorSRRDB(t *testing.T) {
@@ -81,6 +101,62 @@ func TestSceneDetectorSRRDBFetchesIMDbWhenSearchOmitsIt(t *testing.T) {
 	}
 	if result.IMDBID != 7654321 {
 		t.Fatalf("unexpected imdb id: %d", result.IMDBID)
+	}
+}
+
+func TestSceneDetectorSRRDBLogsNFODownloadLifecycle(t *testing.T) {
+	handler := http.NewServeMux()
+	handler.HandleFunc("/v1/search/r:Example.Release", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"resultsCount":1,"results":[{"release":"Example.Release.2024.1080p-WEB","imdbId":"1234567","hasNFO":"yes"}]}`))
+	})
+	handler.HandleFunc("/v1/details/Example.Release.2024.1080p-WEB", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"files":[{"name":"Example.Release.Custom.NFO"}]}`))
+	})
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	client := server.Client()
+	baseTransport := client.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.EqualFold(req.URL.Host, "www.srrdb.com") {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("URL: https://www.imdb.com/title/tt1234567/")),
+				Request:    req,
+			}, nil
+		}
+		return baseTransport.RoundTrip(req)
+	})
+
+	logger := &sceneLogRecorder{}
+	detector := newSRRDBDetector(client, server.URL, t.TempDir(), t.TempDir())
+	detector.logger = logger
+
+	result, err := detector.Detect(context.Background(), api.PreparedMetadata{VideoPath: "/data/Example.Release.mkv"})
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if result.NFOPath == "" || !result.NFONew {
+		t.Fatalf("expected downloaded NFO, got path=%q new=%t", result.NFOPath, result.NFONew)
+	}
+	logs := logger.join()
+	for _, want := range []string{
+		"metadata: scene nfo lookup start",
+		"metadata: scene nfo details selected",
+		"metadata: scene nfo downloading",
+		"metadata: scene nfo downloaded",
+		"metadata: scene nfo attached downloaded=true",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("expected log %q in:\n%s", want, logs)
+		}
 	}
 }
 
@@ -344,6 +420,395 @@ func TestSceneDetectorSRRDBNFOContextCancellationIsFatal(t *testing.T) {
 	}
 	if result.IsScene {
 		t.Fatalf("expected cancellation to abort scene match, got %#v", result)
+	}
+}
+
+// srrdbFallbackHandler routes the srrdb endpoints used by the imdb: fallback so
+// tests can drive scene/rename detection without touching the live service.
+type srrdbFallbackHandler struct {
+	imdbPages map[int]string // page -> JSON body for /v1/search/imdb:<id>/...
+	details   map[string]string
+	rResults  map[string]string // r:<name> -> JSON body (name is the unescaped search term)
+	imdbStat  int               // non-zero overrides the imdb: search status code
+	imdbHits  *atomic.Int32     // when set, counts /v1/search/imdb: requests
+}
+
+func (h srrdbFallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	path := r.URL.Path
+	switch {
+	case strings.Contains(path, "/v1/search/r:"):
+		name := path[strings.Index(path, "/v1/search/r:")+len("/v1/search/r:"):]
+		if body, ok := h.rResults[name]; ok {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		_, _ = w.Write([]byte(`{"resultsCount":0,"results":[]}`))
+	case strings.Contains(path, "/v1/search/imdb:"):
+		if h.imdbHits != nil {
+			h.imdbHits.Add(1)
+		}
+		if h.imdbStat != 0 {
+			w.WriteHeader(h.imdbStat)
+			return
+		}
+		page := 1
+		if _, after, ok := strings.Cut(path, "page:"); ok {
+			if p, err := strconv.Atoi(after); err == nil {
+				page = p
+			}
+		}
+		if body, ok := h.imdbPages[page]; ok {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		_, _ = w.Write([]byte(`{"resultsCount":0,"results":[]}`))
+	case strings.HasPrefix(path, "/v1/details/"):
+		release := strings.TrimPrefix(path, "/v1/details/")
+		if body, ok := h.details[release]; ok {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		_, _ = w.Write([]byte(`{"files":[],"archived-files":[]}`))
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func renamedSceneMeta(videoPath string) api.PreparedMetadata {
+	return api.PreparedMetadata{
+		VideoPath:   videoPath,
+		ExternalIDs: api.ExternalIDs{IMDBID: 111161},
+		Release: api.ReleaseInfo{
+			Resolution: "1080p",
+			Year:       2014,
+			Group:      "GRP",
+			Source:     "BluRay",
+			Codec:      []string{"x264"},
+		},
+	}
+}
+
+func TestSceneDetectorIMDBFallbackDetectsRename(t *testing.T) {
+	handler := srrdbFallbackHandler{
+		imdbPages: map[int]string{
+			1: `{"resultsCount":1,"results":[{"release":"Fury.2014.1080p.BluRay.x264-GRP","imdbId":"111161","hasNFO":"no","isForeign":"no"}]}`,
+		},
+		details: map[string]string{
+			"Fury.2014.1080p.BluRay.x264-GRP": `{"files":[],"archived-files":[{"name":"fury.2014.1080p.bluray.x264-grp.mkv","crc":"AABBCCDD","size":8000000000}]}`,
+		},
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	result, err := detector.Detect(context.Background(), renamedSceneMeta("/data/Fury 2014 1080p BluRay x264 GRP.mkv"))
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if !result.IsScene {
+		t.Fatalf("expected scene via imdb fallback")
+	}
+	if !result.Renamed {
+		t.Fatalf("expected renamed verdict")
+	}
+	if result.SceneName != "Fury.2014.1080p.BluRay.x264-GRP" {
+		t.Fatalf("unexpected scene name: %q", result.SceneName)
+	}
+	if result.IMDBID != 111161 {
+		t.Fatalf("unexpected imdb id: %d", result.IMDBID)
+	}
+	if strings.TrimSpace(result.RenamedReason) == "" {
+		t.Fatalf("expected a rename reason")
+	}
+}
+
+func TestSceneDetectorIMDBFallbackUnmodifiedNotRenamed(t *testing.T) {
+	handler := srrdbFallbackHandler{
+		imdbPages: map[int]string{
+			1: `{"resultsCount":1,"results":[{"release":"Fury.2014.1080p.BluRay.x264-GRP","imdbId":"111161","hasNFO":"no"}]}`,
+		},
+		details: map[string]string{
+			"Fury.2014.1080p.BluRay.x264-GRP": `{"archived-files":[{"name":"Fury.2014.1080p.BluRay.x264-GRP.mkv","size":8000000000}]}`,
+		},
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	// On-disk media filename exactly matches the archived scene media filename, so
+	// this must not be flagged as renamed.
+	result, err := detector.Detect(context.Background(), renamedSceneMeta("/data/Fury.2014.1080p.BluRay.x264-GRP.mkv"))
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if !result.IsScene {
+		t.Fatalf("expected scene match")
+	}
+	if result.Renamed {
+		t.Fatalf("did not expect a rename verdict, reason=%q", result.RenamedReason)
+	}
+}
+
+func TestSceneDetectorIMDBFallbackCaseOnlyDiffIsRenamed(t *testing.T) {
+	handler := srrdbFallbackHandler{
+		imdbPages: map[int]string{
+			1: `{"resultsCount":1,"results":[{"release":"Fury.2014.1080p.BluRay.x264-GRP","imdbId":"111161","hasNFO":"no"}]}`,
+		},
+		details: map[string]string{
+			"Fury.2014.1080p.BluRay.x264-GRP": `{"archived-files":[{"name":"fury.2014.1080p.bluray.x264-grp.mkv","size":8000000000}]}`,
+		},
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	// Local media filename matches the archived one except for casing; srrdb is
+	// authoritative, so a casing-only difference is a rename.
+	result, err := detector.Detect(context.Background(), renamedSceneMeta("/data/Fury.2014.1080p.BluRay.x264-GRP.mkv"))
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if !result.IsScene || !result.Renamed {
+		t.Fatalf("expected scene + renamed on casing-only difference, got %#v", result)
+	}
+}
+
+func TestSceneDetectorDrivenFolderMatchDetectsRenamedFile(t *testing.T) {
+	// The maintainer's case: folder is the canonical scene name; the media file
+	// inside is renamed. IMDb tt0132245 is resolved; the imdb: search returns the
+	// release set; the folder candidate selects the exact release; the media file
+	// differs from the archived scene filename ⇒ scene + renamed.
+	const release = "Driven.2001.1080p.BluRay.x264-MOOVEE"
+	handler := srrdbFallbackHandler{
+		imdbPages: map[int]string{
+			1: `{"resultsCount":3,"results":[` +
+				`{"release":"Driven.2001.German.DL.1080p.BluRay.x264-DETAiLS","imdbId":"0132245","isForeign":"yes"},` +
+				`{"release":"Driven.2001.1080p.BluRay.x264-MOOVEE","imdbId":"0132245","isForeign":"no"},` +
+				`{"release":"Driven.2001.720p.BluRay.x264-CiNEFiLE","imdbId":"0132245","isForeign":"no"}]}`,
+		},
+		details: map[string]string{
+			release: `{"archived-files":[{"name":"driven.2001.1080p.bluray.x264-moovee.mkv","crc":"9CDDBFCD","size":4695029966}]}`,
+		},
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	meta := api.PreparedMetadata{
+		SourcePath:  "/data/Driven.2001.1080p.BluRay.x264-MOOVEE",
+		VideoPath:   "/data/Driven.2001.1080p.BluRay.x264-MOOVEE/moovee-driven.mkv",
+		ExternalIDs: api.ExternalIDs{IMDBID: 132245},
+		Release:     api.ReleaseInfo{Resolution: "1080p", Year: 2001, Group: "MOOVEE", Source: "BluRay", Codec: []string{"x264"}, Language: []string{"English"}},
+	}
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	result, err := detector.Detect(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if !result.IsScene {
+		t.Fatalf("expected scene match via folder candidate")
+	}
+	if result.SceneName != release {
+		t.Fatalf("expected release %q, got %q", release, result.SceneName)
+	}
+	if result.IMDBID != 132245 {
+		t.Fatalf("expected imdb 132245, got %d", result.IMDBID)
+	}
+	if !result.Renamed || strings.TrimSpace(result.RenamedReason) == "" {
+		t.Fatalf("expected renamed verdict for renamed media file, got %#v", result)
+	}
+}
+
+func TestSceneDetectorIMDBFallbackPaginates(t *testing.T) {
+	// Page 1 is full (40 wrong-resolution entries); the match is only on page 2.
+	var page1 strings.Builder
+	page1.WriteString(`{"resultsCount":41,"results":[`)
+	for i := range 40 {
+		if i > 0 {
+			page1.WriteString(",")
+		}
+		page1.WriteString(`{"release":"Fury.2014.720p.BluRay.x264-GRP","imdbId":"111161"}`)
+	}
+	page1.WriteString(`]}`)
+
+	handler := srrdbFallbackHandler{
+		imdbPages: map[int]string{
+			1: page1.String(),
+			2: `{"resultsCount":41,"results":[{"release":"Fury.2014.1080p.BluRay.x264-GRP","imdbId":"111161"}]}`,
+		},
+		details: map[string]string{
+			"Fury.2014.1080p.BluRay.x264-GRP": `{"archived-files":[{"name":"fury.2014.1080p.bluray.x264-grp.mkv","size":8000000000}]}`,
+		},
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	result, err := detector.Detect(context.Background(), renamedSceneMeta("/data/Fury 2014 1080p BluRay x264 GRP.mkv"))
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if !result.IsScene || result.SceneName != "Fury.2014.1080p.BluRay.x264-GRP" {
+		t.Fatalf("expected paginated match, got %#v", result)
+	}
+}
+
+func TestSceneDetectorIMDBFallbackSoftFailsOnError(t *testing.T) {
+	handler := srrdbFallbackHandler{imdbStat: http.StatusInternalServerError}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	result, err := detector.Detect(context.Background(), renamedSceneMeta("/data/Fury 2014 1080p BluRay x264 GRP.mkv"))
+	if err != nil {
+		t.Fatalf("expected soft-fail (nil error), got %v", err)
+	}
+	if result.IsScene || result.Renamed {
+		t.Fatalf("expected no scene match on srrdb error, got %#v", result)
+	}
+}
+
+func TestSceneDetectorRSearchSoftFailsOnNetworkError(t *testing.T) {
+	// srrdb unreachable on the r: fallback (no imdb) must not block an upload.
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	})}
+	detector := newSRRDBDetector(client, "https://api.srrdb.com", t.TempDir(), t.TempDir())
+
+	meta := renamedSceneMeta("/data/Fury 2014 1080p BluRay x264 GRP.mkv")
+	meta.ExternalIDs = api.ExternalIDs{} // force the r: fallback path
+	result, err := detector.Detect(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("expected soft-fail (nil error) on r: network error, got %v", err)
+	}
+	if result.IsScene || result.Renamed {
+		t.Fatalf("expected no scene match on srrdb outage, got %#v", result)
+	}
+}
+
+func TestSceneDetectorRFallbackFolderFirstWhenNoIMDb(t *testing.T) {
+	// No imdb id: the r: fallback tries the canonical folder candidate first.
+	const release = "Driven.2001.1080p.BluRay.x264-MOOVEE"
+	handler := http.NewServeMux()
+	handler.HandleFunc("/v1/search/r:"+release, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"resultsCount":1,"results":[{"release":"` + release + `","imdbId":"0132245"}]}`))
+	})
+	handler.HandleFunc("/v1/details/"+release, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"archived-files":[{"name":"driven.2001.1080p.bluray.x264-moovee.mkv","size":4695029966}]}`))
+	})
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	meta := api.PreparedMetadata{
+		SourcePath: "/data/" + release,
+		VideoPath:  "/data/" + release + "/driven.2001.1080p.bluray.x264-moovee.mkv",
+	}
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	result, err := detector.Detect(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if !result.IsScene || result.SceneName != release {
+		t.Fatalf("expected r: folder match %q, got %#v", release, result)
+	}
+	if result.Renamed {
+		t.Fatalf("did not expect rename (media filename matches archived), got reason=%q", result.RenamedReason)
+	}
+}
+
+func TestSceneDetectorRSearchSoftFailsOnMalformedBody(t *testing.T) {
+	handler := http.NewServeMux()
+	handler.HandleFunc("/v1/search/r:Example.Release", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"resultsCount":1,"results":[`)) // truncated JSON
+	})
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	result, err := detector.Detect(context.Background(), api.PreparedMetadata{VideoPath: "/data/Example.Release.mkv"})
+	if err != nil {
+		t.Fatalf("expected soft-fail (nil error) on malformed r: body, got %v", err)
+	}
+	if result.IsScene {
+		t.Fatalf("expected no scene match on malformed body, got %#v", result)
+	}
+}
+
+func TestSceneDetectorIMDBFallbackSkippedWithoutIMDbID(t *testing.T) {
+	imdbHits := &atomic.Int32{}
+	handler := srrdbFallbackHandler{imdbHits: imdbHits}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	meta := renamedSceneMeta("/data/Fury 2014 1080p BluRay x264 GRP.mkv")
+	meta.ExternalIDs = api.ExternalIDs{} // no known id at detect time
+	result, err := detector.Detect(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if result.IsScene {
+		t.Fatalf("expected no fallback without an imdb id, got %#v", result)
+	}
+	if got := imdbHits.Load(); got != 0 {
+		t.Fatalf("expected no imdb: request without an imdb id, got %d", got)
+	}
+}
+
+func TestSceneDetectorFallsBackToRWhenIMDbFindsNoMatch(t *testing.T) {
+	// IMDb id is known, but the imdb: search returns only a non-matching release;
+	// Detect must fall through to the exact r: folder search rather than give up.
+	const release = "Driven.2001.1080p.BluRay.x264-MOOVEE"
+	handler := srrdbFallbackHandler{
+		imdbPages: map[int]string{
+			1: `{"resultsCount":1,"results":[{"release":"Driven.2001.720p.BluRay.x264-CiNEFiLE","imdbId":"0132245"}]}`,
+		},
+		rResults: map[string]string{
+			release: `{"resultsCount":1,"results":[{"release":"` + release + `","imdbId":"0132245"}]}`,
+		},
+		details: map[string]string{
+			release: `{"archived-files":[{"name":"driven.2001.1080p.bluray.x264-moovee.mkv","size":4695029966}]}`,
+		},
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	meta := api.PreparedMetadata{
+		SourcePath:  "/data/" + release,
+		VideoPath:   "/data/" + release + "/driven.2001.1080p.bluray.x264-moovee.mkv",
+		ExternalIDs: api.ExternalIDs{IMDBID: 132245},
+		Release:     api.ReleaseInfo{Resolution: "1080p", Year: 2001, Group: "MOOVEE"},
+	}
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	result, err := detector.Detect(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if !result.IsScene || result.SceneName != release {
+		t.Fatalf("expected r: fallback match %q after imdb miss, got %#v", release, result)
+	}
+}
+
+func TestSceneDetectorIMDBFallbackNoConfidentCandidate(t *testing.T) {
+	// Only wrong-resolution releases exist for the title: no confident match.
+	handler := srrdbFallbackHandler{
+		imdbPages: map[int]string{
+			1: `{"resultsCount":2,"results":[{"release":"Fury.2014.720p.BluRay.x264-GRP","imdbId":"111161"},{"release":"Fury.2014.480p.DVDRip.x264-GRP","imdbId":"111161"}]}`,
+		},
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	detector := newSRRDBDetector(server.Client(), server.URL, t.TempDir(), t.TempDir())
+	result, err := detector.Detect(context.Background(), renamedSceneMeta("/data/Fury 2014 1080p BluRay x264 GRP.mkv"))
+	if err != nil {
+		t.Fatalf("Detect error: %v", err)
+	}
+	if result.IsScene || result.Renamed {
+		t.Fatalf("expected no match for a non-matching candidate set, got %#v", result)
 	}
 }
 
