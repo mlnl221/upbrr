@@ -37,8 +37,9 @@ const (
 )
 
 // checkA4KRequirements rejects WEBRips outright and enforces A4K's minimum
-// encode bitrate for movies and TV episodes. Full-disc uploads are exempt
-// from the bitrate floor since raw discs are never encode-bitrate limited.
+// encode bitrate for movies and TV episodes. A readable MediaInfo report is
+// required to pass the bitrate floor for non-disc uploads; full-disc
+// uploads are exempt since raw discs are never encode-bitrate limited.
 func checkA4KRequirements(ctx context.Context, meta api.PreparedMetadata, _ api.Logger) Result {
 	select {
 	case <-ctx.Done():
@@ -64,6 +65,9 @@ func isA4KWebRip(meta api.PreparedMetadata) bool {
 	if a4kWebRipRegex.MatchString(meta.Source) {
 		return true
 	}
+	if a4kWebRipRegex.MatchString(meta.Release.Source) {
+		return true
+	}
 	return a4kWebRipRegex.MatchString(meta.ReleaseName)
 }
 
@@ -74,7 +78,7 @@ func checkA4KBitrate(meta api.PreparedMetadata) (string, bool) {
 
 	bitrateMbps, ok := mediaInfoVideoBitrateMbps(meta.MediaInfoJSONPath)
 	if !ok {
-		return "", true
+		return "A4K requires a readable MediaInfo report to verify the encode meets the minimum bitrate.", false
 	}
 
 	minBitrate := a4kMovieMinBitrateMbps
@@ -93,8 +97,11 @@ func checkA4KBitrate(meta api.PreparedMetadata) (string, bool) {
 // mediaInfoVideoBitrateMbps reads the video track's bitrate from a MediaInfo
 // JSON report. When MediaInfo didn't report a video track bitrate directly,
 // it's approximated as the General track's OverallBitRate minus the summed
-// bitrate of all audio tracks. Returns ok=false when neither is available or
-// parseable, rather than failing the caller's rule.
+// bitrate of all audio tracks. Returns ok=false when the report is missing,
+// unreadable, malformed, or the bitrate can't be reliably determined (e.g.
+// an audio track's own bitrate isn't parseable, which would otherwise
+// understate the subtraction and overstate the derived video bitrate); the
+// caller treats ok=false as a bitrate-floor failure for non-disc uploads.
 func mediaInfoVideoBitrateMbps(path string) (float64, bool) {
 	trimmed := strings.TrimSpace(path)
 	if trimmed == "" {
@@ -116,6 +123,7 @@ func mediaInfoVideoBitrateMbps(path string) (float64, bool) {
 
 	var overallBitRate, videoBitRate string
 	var audioBitRateSum float64
+	audioBitRateFullyKnown := true
 	for _, track := range doc.Media.Track {
 		trackType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", track["@type"])))
 		switch trackType {
@@ -130,12 +138,17 @@ func mediaInfoVideoBitrateMbps(path string) (float64, bool) {
 		case "audio":
 			if bps, ok := firstNumericFloat(fmt.Sprintf("%v", track["BitRate"])); ok {
 				audioBitRateSum += bps
+			} else {
+				audioBitRateFullyKnown = false
 			}
 		}
 	}
 
 	if bps, ok := firstNumericFloat(videoBitRate); ok {
 		return bps / 1_000_000, true
+	}
+	if !audioBitRateFullyKnown {
+		return 0, false
 	}
 
 	overallBps, ok := firstNumericFloat(overallBitRate)

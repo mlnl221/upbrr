@@ -654,6 +654,15 @@ func TestEvaluateRulesA4KBlocksWebRip(t *testing.T) {
 				SubtitleLanguages:      []string{"English"},
 			},
 		},
+		{
+			name: "release source field",
+			meta: api.PreparedMetadata{
+				Release:                api.ReleaseInfo{Source: "WEB-Rip"},
+				ValidMediaInfoSettings: true,
+				AudioLanguages:         []string{"English"},
+				SubtitleLanguages:      []string{"English"},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -833,9 +842,11 @@ func TestEvaluateRulesA4KFallsBackToOverallMinusAudioBitrate(t *testing.T) {
 // TestEvaluateRulesA4KRealWorldReportMissingVideoAndAudioBitrate reproduces a
 // real MediaInfo report (Shayar.2024.2160p.WEB-DL.AAC2.0.H264.mkv) where
 // neither the Video nor Audio track reports a bit rate, only the General
-// track's "Overall bit rate: 7 937 kb/s". With no audio bitrate to
-// subtract, the derived video bitrate falls back to the overall bitrate
-// itself, which is below A4K's 10 Mbps movie floor.
+// track's "Overall bit rate: 7 937 kb/s". Since the audio track's own
+// bitrate isn't parseable, subtracting it from the overall bitrate can't be
+// trusted (it would understate the subtraction and overstate the derived
+// video bitrate), so the upload is rejected as unverifiable rather than
+// evaluated against the numeric floor.
 func TestEvaluateRulesA4KRealWorldReportMissingVideoAndAudioBitrate(t *testing.T) {
 	t.Parallel()
 
@@ -849,10 +860,10 @@ func TestEvaluateRulesA4KRealWorldReportMissingVideoAndAudioBitrate(t *testing.T
 	failures := EvaluateRules(context.Background(), "A4K", meta, nil)
 	failure, ok := findRuleFailure(failures, "extra_check")
 	if !ok {
-		t.Fatalf("expected extra_check failure for 7.937 Mbps overall bitrate, got %#v", failures)
+		t.Fatalf("expected extra_check failure for unverifiable bitrate, got %#v", failures)
 	}
-	if !strings.Contains(failure.Reason, "Movie") || !strings.Contains(failure.Reason, "7.9") {
-		t.Fatalf("expected movie bitrate reason mentioning 7.9 Mbps, got %q", failure.Reason)
+	if !strings.Contains(failure.Reason, "MediaInfo") {
+		t.Fatalf("expected unverifiable bitrate reason, got %q", failure.Reason)
 	}
 }
 
@@ -871,6 +882,75 @@ func TestEvaluateRulesA4KAllowsOverallMinusAudioBitrateAboveThreshold(t *testing
 	failures := EvaluateRules(context.Background(), "A4K", meta, nil)
 	if len(failures) != 0 {
 		t.Fatalf("expected no failures when derived bitrate is above threshold, got %#v", failures)
+	}
+}
+
+func TestEvaluateRulesA4KRejectsWhenBitrateUnverifiable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "empty path", path: ""},
+		{name: "unreadable path", path: filepath.Join(t.TempDir(), "does-not-exist.json")},
+		{name: "malformed json", path: writeA4KMalformedMediaInfoJSON(t)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			meta := api.PreparedMetadata{
+				ExternalIDs:            api.ExternalIDs{Category: "movie"},
+				MediaInfoJSONPath:      tc.path,
+				ValidMediaInfoSettings: true,
+				AudioLanguages:         []string{"English"},
+				SubtitleLanguages:      []string{"English"},
+			}
+			failures := EvaluateRules(context.Background(), "A4K", meta, nil)
+			failure, ok := findRuleFailure(failures, "extra_check")
+			if !ok {
+				t.Fatalf("expected extra_check failure for unverifiable bitrate, got %#v", failures)
+			}
+			if !strings.Contains(failure.Reason, "MediaInfo") {
+				t.Fatalf("expected unverifiable bitrate reason, got %q", failure.Reason)
+			}
+		})
+	}
+}
+
+func writeA4KMalformedMediaInfoJSON(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "mediainfo.json")
+	if err := os.WriteFile(path, []byte(`{"media":{"track":[`), 0o600); err != nil {
+		t.Fatalf("write malformed mediainfo json: %v", err)
+	}
+	return path
+}
+
+func TestEvaluateRulesA4KRejectsWhenOneOfMultipleAudioTracksIsUnparseable(t *testing.T) {
+	t.Parallel()
+
+	// One audio track reports a bitrate, a second doesn't. Summing only the
+	// known track would understate total audio bitrate and overstate the
+	// derived video bitrate, so this must be treated as unverifiable rather
+	// than evaluated with a partial subtraction.
+	meta := api.PreparedMetadata{
+		ExternalIDs:            api.ExternalIDs{Category: "movie"},
+		MediaInfoJSONPath:      writeA4KMediaInfoJSONWithTracks(t, "13000000", "", []string{"1500000", ""}),
+		ValidMediaInfoSettings: true,
+		AudioLanguages:         []string{"English"},
+		SubtitleLanguages:      []string{"English"},
+	}
+	failures := EvaluateRules(context.Background(), "A4K", meta, nil)
+	failure, ok := findRuleFailure(failures, "extra_check")
+	if !ok {
+		t.Fatalf("expected extra_check failure for partially unparseable audio bitrates, got %#v", failures)
+	}
+	if !strings.Contains(failure.Reason, "MediaInfo") {
+		t.Fatalf("expected unverifiable bitrate reason, got %q", failure.Reason)
 	}
 }
 
