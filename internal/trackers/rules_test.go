@@ -830,6 +830,32 @@ func TestEvaluateRulesA4KFallsBackToOverallMinusAudioBitrate(t *testing.T) {
 	}
 }
 
+// TestEvaluateRulesA4KRealWorldReportMissingVideoAndAudioBitrate reproduces a
+// real MediaInfo report (Shayar.2024.2160p.WEB-DL.AAC2.0.H264.mkv) where
+// neither the Video nor Audio track reports a bit rate, only the General
+// track's "Overall bit rate: 7 937 kb/s". With no audio bitrate to
+// subtract, the derived video bitrate falls back to the overall bitrate
+// itself, which is below A4K's 10 Mbps movie floor.
+func TestEvaluateRulesA4KRealWorldReportMissingVideoAndAudioBitrate(t *testing.T) {
+	t.Parallel()
+
+	meta := api.PreparedMetadata{
+		ExternalIDs:            api.ExternalIDs{Category: "movie"},
+		MediaInfoJSONPath:      writeA4KMediaInfoJSONWithTracks(t, "7937000", "", []string{""}),
+		ValidMediaInfoSettings: true,
+		AudioLanguages:         []string{"English"},
+		SubtitleLanguages:      []string{"English"},
+	}
+	failures := EvaluateRules(context.Background(), "A4K", meta, nil)
+	failure, ok := findRuleFailure(failures, "extra_check")
+	if !ok {
+		t.Fatalf("expected extra_check failure for 7.937 Mbps overall bitrate, got %#v", failures)
+	}
+	if !strings.Contains(failure.Reason, "Movie") || !strings.Contains(failure.Reason, "7.9") {
+		t.Fatalf("expected movie bitrate reason mentioning 7.9 Mbps, got %q", failure.Reason)
+	}
+}
+
 func TestEvaluateRulesA4KAllowsOverallMinusAudioBitrateAboveThreshold(t *testing.T) {
 	t.Parallel()
 
